@@ -2,30 +2,43 @@ package com.example.fixedwebview;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.DownloadManager;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.util.Base64;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
+import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Toast;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity {
 
     // The one address the app opens. Change this line to point somewhere else.
-    private static final String START_URL = "https://anktsngh48.github.io/nkt-sankra/";
+    private static final String START_URL = "https://www.vedantu.com";
 
     // Camera and microphone are only given to START_URL's own website (and its subdomains).
     // To also allow another website, add its name here, for example { "example.com" }.
@@ -33,11 +46,13 @@ public class MainActivity extends Activity {
 
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int REQ_MEDIA_PERMISSIONS = 1002;
+    private static final int REQ_STORAGE_PERMISSION = 1003;
 
     private WebView web;
     private ValueCallback<Uri[]> filePathCallback;
     private PermissionRequest pendingMediaRequest;
     private String[] pendingMediaResources;
+    private Runnable pendingAfterStoragePermission;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -64,6 +79,13 @@ public class MainActivity extends Activity {
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
         cookies.setAcceptThirdPartyCookies(web, true);
+
+        // Lets files that a page builds itself (blob: links) be saved
+        web.addJavascriptInterface(new DownloadBridge(), "AndroidDownload");
+
+        // File downloads: saved into the phone's Downloads folder
+        web.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) ->
+                handleDownload(url, userAgent, contentDisposition, mimeType));
 
         web.setWebChromeClient(new WebChromeClient() {
 
@@ -104,7 +126,9 @@ public class MainActivity extends Activity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
                 String scheme = uri.getScheme();
-                if ("http".equals(scheme) || "https".equals(scheme)) {
+                if ("http".equals(scheme) || "https".equals(scheme)
+                        || "blob".equals(scheme) || "data".equals(scheme)
+                        || "about".equals(scheme)) {
                     return false; // stay inside the app
                 }
                 // tel:, mailto:, whatsapp:, upi: and similar open in the matching app
@@ -122,6 +146,203 @@ public class MainActivity extends Activity {
         } else {
             web.loadUrl(START_URL);
         }
+    }
+
+    // ---------- File downloads ----------
+
+    private void handleDownload(final String url, final String userAgent,
+                                String contentDisposition, String mimeType) {
+        boolean normalLink = url.startsWith("http://") || url.startsWith("https://");
+        final String filename = URLUtil.guessFileName(
+                normalLink ? url : "download", contentDisposition, mimeType);
+
+        if (url.startsWith("blob:")) {
+            fetchBlob(url, mimeType, filename);
+        } else if (url.startsWith("data:")) {
+            saveDataUrl(url, filename);
+        } else {
+            final String type = mimeType;
+            withStoragePermission(() -> enqueueDownload(url, userAgent, filename, type));
+        }
+    }
+
+    // Normal links: the phone's download manager does the work and shows a notification
+    private void enqueueDownload(String url, String userAgent, String filename, String mimeType) {
+        try {
+            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+            if (mimeType != null && !mimeType.isEmpty()) {
+                req.setMimeType(mimeType);
+            }
+            String cookie = CookieManager.getInstance().getCookie(url);
+            if (cookie != null) {
+                req.addRequestHeader("Cookie", cookie); // keeps logged-in downloads working
+            }
+            if (userAgent != null) {
+                req.addRequestHeader("User-Agent", userAgent);
+            }
+            req.setTitle(filename);
+            req.setNotificationVisibility(
+                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
+            DownloadManager manager = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            manager.enqueue(req);
+            Toast.makeText(this, "Downloading " + filename, Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not download this file", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    // blob: links only exist inside the page, so the page itself hands the bytes over
+    private void fetchBlob(String blobUrl, String mime, String filename) {
+        String safeUrl = blobUrl.replace("\\", "").replace("'", "%27");
+        String safeMime = (mime == null || mime.isEmpty())
+                ? "application/octet-stream"
+                : mime.replaceAll("[^A-Za-z0-9./+;=_-]", "");
+        String safeName = filename.replaceAll("[^A-Za-z0-9._ -]", "_");
+        String js = "(function(){"
+                + "var x=new XMLHttpRequest();"
+                + "x.open('GET','" + safeUrl + "',true);"
+                + "x.responseType='blob';"
+                + "x.onload=function(){"
+                + "var r=new FileReader();"
+                + "r.onloadend=function(){"
+                + "var d=r.result;"
+                + "AndroidDownload.save(d.substring(d.indexOf(',')+1),"
+                + "x.response.type||'" + safeMime + "','" + safeName + "');"
+                + "};"
+                + "r.readAsDataURL(x.response);"
+                + "};"
+                + "x.send();"
+                + "})();";
+        web.evaluateJavascript(js, null);
+    }
+
+    private void saveDataUrl(String url, String filename) {
+        try {
+            int comma = url.indexOf(',');
+            if (comma < 0) {
+                return;
+            }
+            String meta = url.substring(5, comma);
+            String payload = url.substring(comma + 1);
+            boolean isBase64 = meta.endsWith(";base64");
+            String mime = meta.replace(";base64", "");
+            int semi = mime.indexOf(';');
+            if (semi >= 0) {
+                mime = mime.substring(0, semi);
+            }
+            byte[] bytes = isBase64
+                    ? Base64.decode(payload, Base64.DEFAULT)
+                    : Uri.decode(payload).getBytes(StandardCharsets.UTF_8);
+            saveFile(filename, mime, bytes);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not save this file", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    // The page calls this (through DownloadBridge) with a file it built itself
+    public class DownloadBridge {
+        @JavascriptInterface
+        public void save(String base64, String mimeType, String filename) {
+            byte[] decoded = null;
+            try {
+                decoded = Base64.decode(base64, Base64.DEFAULT);
+            } catch (Exception ignored) {
+                // bad data
+            }
+            if (decoded == null) {
+                return;
+            }
+            final byte[] bytes = decoded;
+            runOnUiThread(() -> {
+                // Only the app's own website may save files this way
+                if (!isTrustedOrigin(Uri.parse(String.valueOf(web.getUrl())))) {
+                    return;
+                }
+                saveFile(filename, mimeType, bytes);
+            });
+        }
+    }
+
+    private void saveFile(String rawName, String mime, final byte[] data) {
+        final String name = (rawName == null || rawName.isEmpty())
+                ? "download"
+                : rawName.replaceAll("[\\\\/:*?\"<>|]", "_");
+        final String type = (mime == null || mime.isEmpty()) ? "application/octet-stream" : mime;
+        withStoragePermission(() -> new Thread(() -> {
+            final boolean ok = saveToDownloads(name, type, data);
+            runOnUiThread(() -> Toast.makeText(this,
+                    ok ? "Saved to Downloads: " + name : "Could not save " + name,
+                    Toast.LENGTH_LONG).show());
+        }).start());
+    }
+
+    private boolean saveToDownloads(String filename, String mime, byte[] data) {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Downloads.DISPLAY_NAME, filename);
+                values.put(MediaStore.Downloads.MIME_TYPE, mime);
+                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                Uri uri = getContentResolver().insert(
+                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                if (uri == null) {
+                    return false;
+                }
+                try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    if (out == null) {
+                        return false;
+                    }
+                    out.write(data);
+                }
+                return true;
+            } else {
+                File dir = Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_DOWNLOADS);
+                if (!dir.exists()) {
+                    dir.mkdirs();
+                }
+                File file = uniqueFile(dir, filename);
+                try (FileOutputStream out = new FileOutputStream(file)) {
+                    out.write(data);
+                }
+                MediaScannerConnection.scanFile(
+                        this, new String[]{file.getAbsolutePath()}, null, null);
+                return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static File uniqueFile(File dir, String filename) {
+        File file = new File(dir, filename);
+        if (!file.exists()) {
+            return file;
+        }
+        int dot = filename.lastIndexOf('.');
+        String base = dot > 0 ? filename.substring(0, dot) : filename;
+        String ext = dot > 0 ? filename.substring(dot) : "";
+        int n = 1;
+        while (file.exists()) {
+            file = new File(dir, base + " (" + n + ")" + ext);
+            n++;
+        }
+        return file;
+    }
+
+    // Android 9 and older need the phone's storage permission to save into Downloads.
+    // Android 10 and newer do not.
+    private void withStoragePermission(Runnable action) {
+        if (Build.VERSION.SDK_INT >= 29
+                || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED) {
+            action.run();
+            return;
+        }
+        pendingAfterStoragePermission = action;
+        requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                REQ_STORAGE_PERMISSION);
     }
 
     // ---------- Camera and microphone ----------
@@ -201,6 +422,21 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == REQ_STORAGE_PERMISSION) {
+            Runnable action = pendingAfterStoragePermission;
+            pendingAfterStoragePermission = null;
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (action != null && granted) {
+                action.run();
+            } else if (action != null) {
+                Toast.makeText(this, "Allow storage access to save files",
+                        Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+
         if (requestCode != REQ_MEDIA_PERMISSIONS || pendingMediaRequest == null) {
             return;
         }
