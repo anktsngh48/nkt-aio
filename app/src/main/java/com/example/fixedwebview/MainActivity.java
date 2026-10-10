@@ -45,7 +45,7 @@ public class MainActivity extends Activity {
         // Keep logins working
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
-        cookies.setAcceptThirdPartyCookie(web, true);
+        cookies.setAcceptThirdPartyCookies(web, true);
 
         web.setWebChromeClient(new WebChromeClient());
         web.setWebViewClient(new WebViewClient() {
