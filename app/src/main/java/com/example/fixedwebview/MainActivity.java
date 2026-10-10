@@ -18,7 +18,7 @@ import android.webkit.WebViewClient;
 public class MainActivity extends Activity {
 
     // The one address the app opens. Change this line to point somewhere else.
-    private static final String START_URL = "https://www.vedantu.com";
+    private static final String START_URL = "https://anktsngh48.github.io/nkt-sankra";
 
     private WebView web;
 
