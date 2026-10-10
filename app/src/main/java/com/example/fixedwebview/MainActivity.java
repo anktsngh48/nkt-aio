@@ -6,6 +6,7 @@ import android.app.DownloadManager;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
@@ -18,6 +19,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.MimeTypeMap;
 import android.webkit.PermissionRequest;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
@@ -38,11 +40,27 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     // The one address the app opens. Change this line to point somewhere else.
-    private static final String START_URL = "https://anktsngh48.github.io/nkt-sankra/";
+    private static final String START_URL = "https://www.vedantu.com";
 
     // Camera and microphone are only given to START_URL's own website (and its subdomains).
     // To also allow another website, add its name here, for example { "example.com" }.
     private static final String[] EXTRA_TRUSTED_HOSTS = {};
+
+    // Android does not tell us the file name a page gave to a file it built itself,
+    // so this small script remembers the name from the page's download link.
+    private static final String DOWNLOAD_HOOK_JS = "(function(){"
+            + "if(window.__dlHook){return;}window.__dlHook=true;"
+            + "function note(a){try{if(a&&a.hasAttribute&&a.hasAttribute('download')){"
+            + "window.__lastDownloadName=a.getAttribute('download')||'';}}catch(e){}}"
+            + "var oc=HTMLAnchorElement.prototype.click;"
+            + "HTMLAnchorElement.prototype.click=function(){note(this);return oc.apply(this,arguments);};"
+            + "var od=EventTarget.prototype.dispatchEvent;"
+            + "EventTarget.prototype.dispatchEvent=function(ev){"
+            + "try{if(ev&&ev.type==='click'){note(this);}}catch(e){}"
+            + "return od.apply(this,arguments);};"
+            + "document.addEventListener('click',function(e){var t=e.target;"
+            + "while(t&&t.tagName!=='A'){t=t.parentElement;}note(t);},true);"
+            + "})();";
 
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int REQ_MEDIA_PERMISSIONS = 1002;
@@ -122,6 +140,18 @@ public class MainActivity extends Activity {
         });
 
         web.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                view.evaluateJavascript(DOWNLOAD_HOOK_JS, null);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                view.evaluateJavascript(DOWNLOAD_HOOK_JS, null);
+            }
+
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
@@ -207,8 +237,10 @@ public class MainActivity extends Activity {
                 + "var r=new FileReader();"
                 + "r.onloadend=function(){"
                 + "var d=r.result;"
+                + "var n=window.__lastDownloadName||'" + safeName + "';"
+                + "window.__lastDownloadName='';"
                 + "AndroidDownload.save(d.substring(d.indexOf(',')+1),"
-                + "x.response.type||'" + safeMime + "','" + safeName + "');"
+                + "x.response.type||'" + safeMime + "',n);"
                 + "};"
                 + "r.readAsDataURL(x.response);"
                 + "};"
@@ -265,16 +297,77 @@ public class MainActivity extends Activity {
     }
 
     private void saveFile(String rawName, String mime, final byte[] data) {
-        final String name = (rawName == null || rawName.isEmpty())
+        String cleanName = (rawName == null || rawName.isEmpty())
                 ? "download"
                 : rawName.replaceAll("[\\\\/:*?\"<>|]", "_");
-        final String type = (mime == null || mime.isEmpty()) ? "application/octet-stream" : mime;
+        cleanName = fixExtension(cleanName, data); // e.g. .bin becomes .xlsx when the file is Excel
+        final String name = cleanName;
+        String guessedType = (mime == null || mime.isEmpty()) ? "application/octet-stream" : mime;
+        if (guessedType.startsWith("application/octet-stream")) {
+            int dot = name.lastIndexOf('.');
+            if (dot >= 0 && dot < name.length() - 1) {
+                String fromName = MimeTypeMap.getSingleton()
+                        .getMimeTypeFromExtension(name.substring(dot + 1).toLowerCase());
+                if (fromName != null) {
+                    guessedType = fromName;
+                }
+            }
+        }
+        final String type = guessedType;
         withStoragePermission(() -> new Thread(() -> {
             final boolean ok = saveToDownloads(name, type, data);
             runOnUiThread(() -> Toast.makeText(this,
                     ok ? "Saved to Downloads: " + name : "Could not save " + name,
                     Toast.LENGTH_LONG).show());
         }).start());
+    }
+
+    // If the file has no real ending (or only .bin), look inside it to find out what it is
+    private static String fixExtension(String name, byte[] data) {
+        int dot = name.lastIndexOf('.');
+        boolean noExtension = dot <= 0;
+        if (!noExtension && !name.toLowerCase().endsWith(".bin")) {
+            return name;
+        }
+        String ext = sniffExtension(data);
+        if (ext == null) {
+            return name;
+        }
+        String base = noExtension ? name : name.substring(0, dot);
+        return base + ext;
+    }
+
+    private static String sniffExtension(byte[] d) {
+        if (d == null || d.length < 4) {
+            return null;
+        }
+        if (d[0] == '%' && d[1] == 'P' && d[2] == 'D' && d[3] == 'F') {
+            return ".pdf";
+        }
+        if ((d[0] & 0xFF) == 0xFF && (d[1] & 0xFF) == 0xD8) {
+            return ".jpg";
+        }
+        if ((d[0] & 0xFF) == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') {
+            return ".png";
+        }
+        if (d[0] == 'P' && d[1] == 'K') {
+            // Excel, Word and PowerPoint files are zip files; the names inside tell them apart
+            int n = Math.min(d.length, 8192);
+            String head = new String(d, 0, n, StandardCharsets.ISO_8859_1);
+            String tail = new String(d, d.length - n, n, StandardCharsets.ISO_8859_1);
+            String both = head + tail;
+            if (both.contains("xl/")) {
+                return ".xlsx";
+            }
+            if (both.contains("word/")) {
+                return ".docx";
+            }
+            if (both.contains("ppt/")) {
+                return ".pptx";
+            }
+            return ".zip";
+        }
+        return null;
     }
 
     private boolean saveToDownloads(String filename, String mime, byte[] data) {
