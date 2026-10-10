@@ -2,11 +2,14 @@ package com.example.fixedwebview;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
@@ -14,21 +17,32 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Base64;
+import android.view.Gravity;
+import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.JsPromptResult;
+import android.webkit.JsResult;
 import android.webkit.MimeTypeMap;
 import android.webkit.PermissionRequest;
+import android.webkit.RenderProcessGoneDetail;
+import android.webkit.SafeBrowsingResponse;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.widget.Toast;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.TextView;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -40,7 +54,7 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     // The one address the app opens. Change this line to point somewhere else.
-    private static final String START_URL = "https://anktsngh48.github.io/nkt-sankra/";
+    private static final String START_URL = "https://www.vedantu.com";
 
     // Camera and microphone are only given to START_URL's own website (and its subdomains).
     // To also allow another website, add its name here, for example { "example.com" }.
@@ -72,6 +86,14 @@ public class MainActivity extends Activity {
     private String[] pendingMediaResources;
     private Runnable pendingAfterStoragePermission;
 
+    // The only name ever shown to the person in pop-ups and error pages (never a web address)
+    private static final String BRAND = "NKT";
+
+    private FrameLayout root;
+    private String failedUrl;            // kept only so "Try again" works, never shown
+    private boolean clearHistoryAfterRetry;
+    private boolean skipStateSave;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -85,7 +107,10 @@ public class MainActivity extends Activity {
         }
 
         web = new WebView(this);
-        setContentView(web);
+        root = new FrameLayout(this);
+        root.addView(web, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        setContentView(root);
         hideStatusBar();
 
         WebSettings settings = web.getSettings();
@@ -124,6 +149,69 @@ public class MainActivity extends Activity {
                 return true;
             }
 
+            // Page pop-ups. Android's own versions print the page address in the title,
+            // so they are replaced by our own, titled with the brand name and shown at the top.
+            @Override
+            public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle(BRAND)
+                        .setMessage(message)
+                        .setPositiveButton("OK", (d, which) -> result.confirm())
+                        .setOnCancelListener(d -> result.cancel())
+                        .create();
+                showAtTop(dialog);
+                return true;
+            }
+
+            @Override
+            public boolean onJsConfirm(WebView view, String url, String message, JsResult result) {
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle(BRAND)
+                        .setMessage(message)
+                        .setPositiveButton("OK", (d, which) -> result.confirm())
+                        .setNegativeButton("Cancel", (d, which) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .create();
+                showAtTop(dialog);
+                return true;
+            }
+
+            @Override
+            public boolean onJsPrompt(WebView view, String url, String message,
+                                      String defaultValue, JsPromptResult result) {
+                final EditText input = new EditText(MainActivity.this);
+                input.setSingleLine(true);
+                input.setText(defaultValue);
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle(BRAND)
+                        .setMessage(message)
+                        .setView(input)
+                        .setPositiveButton("OK",
+                                (d, which) -> result.confirm(input.getText().toString()))
+                        .setNegativeButton("Cancel", (d, which) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .create();
+                showAtTop(dialog);
+                return true;
+            }
+
+            @Override
+            public boolean onJsBeforeUnload(WebView view, String url, String message,
+                                            JsResult result) {
+                String text = (message == null || message.isEmpty())
+                        ? "Changes you made may not be saved."
+                        : message;
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle(BRAND)
+                        .setMessage(text)
+                        .setPositiveButton("Leave", (d, which) -> result.confirm())
+                        .setNegativeButton("Stay", (d, which) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .create();
+                showAtTop(dialog);
+                return true;
+            }
+
             // Camera and microphone for pages (video calls, photo capture, voice)
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
@@ -150,12 +238,73 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 view.evaluateJavascript(DOWNLOAD_HOOK_JS, null);
+                // After "Try again", forget the error page so Back does not return to it
+                if (clearHistoryAfterRetry && url != null && !url.startsWith("data:")
+                        && !"about:blank".equals(url)) {
+                    clearHistoryAfterRetry = false;
+                    view.clearHistory();
+                }
+            }
+
+            // No internet, server not found, timeouts and similar
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request,
+                                        WebResourceError error) {
+                super.onReceivedError(view, request, error);
+                if (!request.isForMainFrame()) {
+                    return;
+                }
+                String scheme = request.getUrl().getScheme();
+                if (!"http".equals(scheme) && !"https".equals(scheme)) {
+                    return;
+                }
+                failedUrl = request.getUrl().toString();
+                int code = error.getErrorCode();
+                boolean network = code == ERROR_HOST_LOOKUP || code == ERROR_CONNECT
+                        || code == ERROR_TIMEOUT || code == ERROR_IO;
+                showErrorPage(network
+                        ? "No internet connection, or " + BRAND
+                                + " can't be reached right now. Check your connection and try again."
+                        : BRAND + " couldn't load this page. Please try again.");
+            }
+
+            // The website answered with an error such as 404 or 500
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest request,
+                                            WebResourceResponse errorResponse) {
+                super.onReceivedHttpError(view, request, errorResponse);
+                if (request.isForMainFrame() && errorResponse.getStatusCode() >= 400) {
+                    failedUrl = request.getUrl().toString();
+                    showErrorPage(BRAND + " can't show this page right now (error "
+                            + errorResponse.getStatusCode() + "). Please try again.");
+                }
+            }
+
+            // The built-in "dangerous site" warning prints the address, so it is replaced
+            @Override
+            public void onSafeBrowsingHit(WebView view, WebResourceRequest request,
+                                          int threatType, SafeBrowsingResponse callback) {
+                callback.backToSafety(true);
+                view.post(() -> showErrorPage(
+                        BRAND + " blocked this page because it may not be safe."));
+            }
+
+            // The page's engine crashed: restart cleanly instead of closing the app
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                skipStateSave = true;
+                recreate();
+                return true;
             }
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
                 String scheme = uri.getScheme();
+                if ("nkt".equals(scheme)) { // the "Try again" button on our error page
+                    retryAfterError();
+                    return true;
+                }
                 if ("http".equals(scheme) || "https".equals(scheme)
                         || "blob".equals(scheme) || "data".equals(scheme)
                         || "about".equals(scheme)) {
@@ -176,6 +325,68 @@ public class MainActivity extends Activity {
         } else {
             web.loadUrl(START_URL);
         }
+    }
+
+    // ---------- Error page, top pop-ups ----------
+
+    private void showErrorPage(final String message) {
+        final String html = "<!DOCTYPE html><html><head>"
+                + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                + "<style>body{margin:0;min-height:100vh;display:flex;flex-direction:column;"
+                + "align-items:center;justify-content:center;font-family:sans-serif;"
+                + "background:#fff;color:#14283b;text-align:center;padding:24px;"
+                + "box-sizing:border-box}"
+                + "h1{font-size:30px;margin:0 0 12px}"
+                + "p{font-size:16px;line-height:1.5;margin:0 0 24px;color:#64768a;max-width:420px}"
+                + "a{display:inline-block;padding:12px 28px;border-radius:10px;"
+                + "background:#0a8a96;color:#fff;text-decoration:none;font-weight:600}"
+                + "</style></head><body><h1>" + BRAND + "</h1><p>" + message
+                + "</p><a href='nkt://retry'>Try again</a></body></html>";
+        web.post(() -> web.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null));
+    }
+
+    private void retryAfterError() {
+        clearHistoryAfterRetry = true;
+        web.loadUrl(failedUrl != null ? failedUrl : START_URL);
+    }
+
+    private int dp(int value) {
+        return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    // Shows a dialog near the top of the screen instead of the middle
+    private void showAtTop(AlertDialog dialog) {
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+            WindowManager.LayoutParams lp = window.getAttributes();
+            lp.y = dp(24);
+            window.setAttributes(lp);
+        }
+        dialog.show();
+    }
+
+    // A short message bar at the top of the screen (used instead of bottom pop-ups)
+    private void showTopMessage(final String message) {
+        runOnUiThread(() -> {
+            final TextView bar = new TextView(this);
+            bar.setText(message);
+            bar.setTextColor(Color.WHITE);
+            bar.setTextSize(14);
+            bar.setPadding(dp(16), dp(10), dp(16), dp(10));
+            GradientDrawable background = new GradientDrawable();
+            background.setColor(0xE6222222);
+            background.setCornerRadius(dp(12));
+            bar.setBackground(background);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+            lp.topMargin = dp(24);
+            lp.leftMargin = dp(16);
+            lp.rightMargin = dp(16);
+            root.addView(bar, lp);
+            bar.postDelayed(() -> root.removeView(bar), 3000);
+        });
     }
 
     // ---------- File downloads ----------
@@ -216,9 +427,9 @@ public class MainActivity extends Activity {
             req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename);
             DownloadManager manager = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
             manager.enqueue(req);
-            Toast.makeText(this, "Downloading " + filename, Toast.LENGTH_SHORT).show();
+            showTopMessage("Downloading " + filename);
         } catch (Exception e) {
-            Toast.makeText(this, "Could not download this file", Toast.LENGTH_LONG).show();
+            showTopMessage("Could not download this file");
         }
     }
 
@@ -268,7 +479,7 @@ public class MainActivity extends Activity {
                     : Uri.decode(payload).getBytes(StandardCharsets.UTF_8);
             saveFile(filename, mime, bytes);
         } catch (Exception e) {
-            Toast.makeText(this, "Could not save this file", Toast.LENGTH_LONG).show();
+            showTopMessage("Could not save this file");
         }
     }
 
@@ -316,9 +527,7 @@ public class MainActivity extends Activity {
         final String type = guessedType;
         withStoragePermission(() -> new Thread(() -> {
             final boolean ok = saveToDownloads(name, type, data);
-            runOnUiThread(() -> Toast.makeText(this,
-                    ok ? "Saved to Downloads: " + name : "Could not save " + name,
-                    Toast.LENGTH_LONG).show());
+            showTopMessage(ok ? "Saved to Downloads: " + name : "Could not save " + name);
         }).start());
     }
 
@@ -524,8 +733,7 @@ public class MainActivity extends Activity {
             if (action != null && granted) {
                 action.run();
             } else if (action != null) {
-                Toast.makeText(this, "Allow storage access to save files",
-                        Toast.LENGTH_LONG).show();
+                showTopMessage("Allow storage access to save files");
             }
             return;
         }
@@ -596,7 +804,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        web.saveState(outState);
+        if (!skipStateSave) {
+            web.saveState(outState);
+        }
     }
 
     @Override
