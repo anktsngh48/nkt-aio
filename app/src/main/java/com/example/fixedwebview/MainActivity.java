@@ -25,7 +25,7 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     // The one address the app opens. Change this line to point somewhere else.
-    private static final String START_URL = "https://www.vedantu.com";
+    private static final String START_URL = "https://anktsngh48.github.io/nkt-sankra/";
 
     // Camera and microphone are only given to START_URL's own website (and its subdomains).
     // To also allow another website, add its name here, for example { "example.com" }.
